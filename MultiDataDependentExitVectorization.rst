@@ -157,22 +157,23 @@ Speculated
 Safe Speculation
   We say that speculative execution is safe if it does not introduce new undefined behaviours.  
 
-An obvious candidate for proving speculation safety are loads from memory. This is because with multi-exit loop vectorization, we can now introduce loads from memory that can cause a SEG fault if we try to read from memory that is not derefenceable. Other examples where we need to prove speculation safety is if we introduce a poison value in the vectorized code, while in the scalar form, we did not have such cases. For example, adding two values where we have NoWrapFlags. If in the vectorized form, we speculatively execute this add and we wrap-around, the result of the add is a poison value. If we end up branching on that poison value, we introduce UB.  
+An obvious candidate for proving speculation safety are loads from memory. This is because with multi-exit loop vectorization, we can now introduce loads from memory that can cause a SEG fault if we try to read from memory that is not derefenceable. Other examples where we need to prove speculation safety is if we introduce a poison value in the vectorized code, while in the scalar form, we did not have such cases. For example, adding two values where we have NoWrapFlags. If in the vectorized form, we speculatively execute this add and we wrap-around, the result of the add is a poison value. If we end up branching on that poison value, we introduce undefined behaviour (UB).  
 
-!!! TODO: Talk about immediate UB versus deferred UB. In speculation, immediate UB (loading non-dereferenceable memory or div-by-0) should be avoided, while deferred UB is handled through freeze.
+We make a distinction between immediate undefined behaviour and deferred UB. In speculation, immediate UB (loading non-dereferenceable memory or a div-by-0) should be identified and we should bail out of vectorization. However, deferred UB is poison and is handled through `freeze`.
 
 Let us consider several examples to better understand what “speculation safety” means.  We start with a classical search loop example but written in a bottom tested form (which is the form expected in loop vectorizer): 
 
 .. code::
 
   if ( i < N) {
-   do {
+   while (true) {
     char x = a[i];
     bool c = (x == 0);
     if (c) break;
     foo(x);
-    ++I;
-   } while (i < N);
+    if (!(0 <= i < N)) break;
+    ++i;
+   }
   }
 
 This loop has a single dd-exit guarded by condition ‘c’.  Let’s for simplicity assume array ‘a’ has byte-wide elements with first zero element at position M = N/2, where N mod 2. This way scalar loop will not access anything beyond a[M]. To vectorize this loop it should be safe to evaluate ‘a[i]’ for up to VF bytes beyond memory read on previous vector iteration. Thus, it should be valid to dereference up to VF bytes beyond that accessed in scalar execution. Fortunately, there is another condition “!(0 <= i < N)” guaranteeing vector loop will not try to load more than N bytes from the start of ‘a’ (assuming “VF mod 2” && VF <= N). Thus, it is enough to prove there is N bytes dereferenceable from start of ‘a’.
@@ -201,14 +202,16 @@ Summarizing we end up with the following vector loop:
 
 .. code::
 
-  while() {
+  if ( i < N) {
+   while (true) {
     char x^ = a^;
     char x1^ = freeze(x1^)
     bool c^ = (x1^ == 0^);
-    if (anyof(c^) break;
+    if (anyof(c^)) break;
     foo^(x^);
     if (!(0 <= i < N)) break;
     i += VF;
+   }
   }
 
 Ok, let’s consider a bit more complicated example involving indirect memory access:
@@ -228,7 +231,7 @@ Ok, let’s consider a bit more complicated example involving indirect memory ac
     ++i;
   }
 
-In this example, the first early exit guarded by c1 provides safety of indirect access b[x]. As before, it’s required to prove safety of speculative evaluation of c1 and c2. For c1 the same reasoning as for the previous example works. For c2, things are a bit more interesting. Again, to prove safety of c2 speculative evaluation it’s required to prove dereferenceability of b[x], where “frozen” value of x is used (because ‘x’ is also evaluated speculatively). Since freezing of potentially poison value is essentially ‘undef’ value it’s virtually impossible to prove dereferenceability of b[x].
+In this example, the first early exit guarded by c1 provides safety of indirect access b[x]. As before, it’s required to prove safety of speculative evaluation of c1 and c2. For c1 the same reasoning as for the previous example works. For c2, things are a bit more interesting. Again, to prove safety of c2 speculative evaluation it’s required to prove dereferenceability of b[x], where “frozen” value of x is used (because ‘x’ is also evaluated speculatively). Since freezing of potentially poison value is essentially ‘undef’ value it is impossible to prove dereferenceability of b[x] (without additional tricks which are explained later).
 
 Finally let’s consider a case which requires speculation of potentially faulting instruction. For example, integer division:
 
