@@ -83,6 +83,8 @@ Predication
 
 As it was mentioned vectorization of loops with dd-exits assumes dealing with possibility of exiting the loop in the middle of iteration. That is, all instructions within the loop following taken exit at runtime should not be executed.  It’s important to understand that any instruction (even the very first) of the next iteration follows at runtime all dd-exiting guards of the previous iteration. Most natural way for the vectorizer to achieve conditional execution is through the predication. Let’s see what predicates should look like using the following example:
 
+.. _predication_example:
+
 .. code::
 
    i = 0;
@@ -138,42 +140,44 @@ P :sub:`0` :sup:`LOOP` is a predicate for instructions preceding the first dd-ex
 Hoistability
 ============
  
-As we already know, vector instructions should be executed under corresponding predicates that depend on ALL conditions guarding dd-exits. That means we should hoist all such conditions (and its definitions) to the very beginning.  Of course, such hoisting should not break semantic correctness. Let’s give formal definition of hoisting safety: 
+As we already know, vector instructions should be executed under corresponding predicates that depend on ALL conditions guarding dd-exits. That means we should hoist all such conditions (and their definitions) to the very beginning.  Of course, such hoisting should not break semantic correctness. Let’s give formal definition of hoisting safety: 
 
 Hoisting Safety
   We say it’s safe to hoist instruction to an earlier point in the execution if it produces the same result as in the original execution and early result availability doesn’t cause observable change in the program behavior. 
 
-Please note that if instruction is not executed in the original program, it is free to produce any result including undefined behavior. Typical examples of unsafe instruction hoisting are moving a load ahead of potentially aliasing store or scheduling potentially throwing instruction ahead of another side-effecting instruction. Fortunately, this is not something new to the compiler and there are multiple places doing hoisting safety checks. 
-
+Typical examples of unsafe instruction hoisting are moving a load ahead of potentially aliasing store or scheduling potentially throwing instruction ahead of another side-effecting instruction. In LLVM terms, this is very similar to ``llvm::canSinkOrHoistInst`` used in LICM along with avoiding hoisting over instructions that fail ``isGuaranteedToTransferExecutionToSuccessor`` (for example, may Throw calls or returns). Note that we can still hoist over throwing calls if we prove the instruction we are hoisting is speculatable (see below). 
 
 Speculatability
 ===============
 
-Hoisting safety is required but not enough to guarantee vectorization correctness. In addition, it should be safe to evaluate dd-exiting conditions for iterations potentially not executed in the scalar loop. In other words, since dd-exiting conditions may be explicitly guarded by other dominating conditions as well as implicitly by exiting conditions from the previous iteration(s) it should be safe to evaluate such conditions speculatively. Here is the formal definition(s): 
+Hoisting safety is required but not enough to guarantee vectorization correctness. In addition, it should be safe to evaluate dd-exiting conditions for iterations potentially not executed in the scalar loop. In the scalar loop, dd-exiting conditions may be explicitly guarded by other dominating conditions as well as implicitly by exiting conditions from the previous iteration(s). So, in the vectorized form, it should be safe to evaluate such conditions speculatively. Here is the formal definition(s): 
 
 Speculated
-  An instruction is speculatively executed (or speculated) when it is executed in the modified program while not executed in the original program. 
+  An instruction is speculatively executed (or speculated) when it is executed in the modified program while it potentially may not be executed in the original program. 
 
 Safe Speculation
   We say that speculative execution is safe if it does not introduce new undefined behaviours.  
 
-An obvious candidate for proving speculation safety are loads from memory. This is because with multi-exit loop vectorization, we can now introduce loads from memory that can cause a SEG fault if we try to read from memory that is not derefenceable. Other examples where we need to prove speculation safety is if we introduce a poison value in the vectorized code, while in the scalar form, we did not have such cases. For example, adding two values where we have NoWrapFlags. If in the vectorized form, we speculatively execute this add and we wrap-around, the result of the add is a poison value. If we end up branching on that poison value, we introduce undefined behaviour (UB).  
+One intuitive way to this about this is to take the scalar loop with the data dependent exits and unroll it `VF` times. The first step is we check hoisting safety for all these data dependent exits (from the unrolled iterations) to the start of the loop. Then, we check if these instructions being hoisted are ``isSafeToSpeculativelyExecute`` with the ``ContextInstruction`` being the point it is hoisted to. 
+
+An obvious candidate for proving speculation safety are loads from memory. This is because with multi-exit loop vectorization, we can now perform loads from memory that will cause undefined behaviour if we try to read from memory that is not derefenceable. Other examples where we need to prove speculation safety is if we load or introduce a poison value in the vectorized code and cause immediate UB (by using that poison value), while in the scalar form, we exited the loop before the use of poison. For example, adding two values where we have NoWrapFlags. If in the vectorized form, we speculatively execute this add and we wrap-around, the result of the add is a poison value. If we end up branching on that poison value, we introduce undefined behaviour (UB).  
 
 We make a distinction between immediate undefined behaviour and deferred UB. In speculation, immediate UB (loading non-dereferenceable memory or a div-by-0) should be identified and we should bail out of vectorization. However, deferred UB is poison and is handled through `freeze`.
 
 Let us consider several examples to better understand what “speculation safety” means.  We start with a classical search loop example but written in a bottom tested form (which is the form expected in loop vectorizer): 
 
+
 .. code::
 
+  i = 0;
   if ( i < N) {
-   while (true) {
+   do {
     char x = a[i];
     bool c = (x == 0);
     if (c) break;
     foo(x);
-    if (!(0 <= i < N)) break;
     ++i;
-   }
+   } while (i < N);
   }
 
 This loop has a single dd-exit guarded by condition ‘c’.  Let’s for simplicity assume array ‘a’ has byte-wide elements with first zero element at position M = N/2, where N mod 2. This way scalar loop will not access anything beyond a[M]. To vectorize this loop it should be safe to evaluate ‘a[i]’ for up to VF bytes beyond memory read on previous vector iteration. Thus, it should be valid to dereference up to VF bytes beyond that accessed in scalar execution. Fortunately, there is another condition “!(0 <= i < N)” guaranteeing vector loop will not try to load more than N bytes from the start of ‘a’ (assuming “VF mod 2” && VF <= N). Thus, it is enough to prove there is N bytes dereferenceable from start of ‘a’.
@@ -194,27 +198,28 @@ Ci = [0 :sub:`1`, …0 :sub:`m-1`, 1 :sub:`m`,         undef :sub:`m+1` , …, u
 
 Ci = [0 :sub:`1`, …0 :sub:`m-1`, undef :sub:`m` , undef :sub:`m+1`, …, undef :sub:`n` ], for i > k
 
-This means `C0 | … | Cm` == `freeze(C0) | … | freeze(Cm)`. Thus `CLSZ(C1^|…| Cn^)` == `CLSZ(freeze(C1^)|…| freeze(Cn^))`.
+This means ``C0 | … | Cm`` == ``freeze(C0) | … | freeze(Cm)``. Thus ``CLSZ(C1^|…| Cn^)`` == ``CLSZ(freeze(C1^)|…| freeze(Cn^))``.
 
 So P :sub:`0` :sup:`LOOP` doesn’t change after freezing. Since P :sub:`0` :sup:`LOOP` hasn’t changed, it’s easy to see that P :sub:`I` :sup:`LOOP` and P :sub:`I` :sup:`EXIT` do not change either.
 
-Summarizing we end up with the following vector loop:
+Summarizing we end up with the following vector loop (we avoid showing the scalar post loop for convenience):
+
 
 .. code::
 
+  i = 0;
   if ( i < N) {
-   while (true) {
+   do {
     char x^ = a^;
-    char x1^ = freeze(x1^)
+    char x1^ = freeze(x^)
     bool c^ = (x1^ == 0^);
     if (anyof(c^)) break;
     foo^(x^);
-    if (!(0 <= i < N)) break;
     i += VF;
-   }
+   } while ( i < N);
   }
 
-Ok, let’s consider a bit more complicated example involving indirect memory access:
+Let us consider a bit more complicated example involving indirect memory access:
 
 .. code::
 
@@ -227,13 +232,14 @@ Ok, let’s consider a bit more complicated example involving indirect memory ac
     bool c2 = (y == 0);
     if (c2) break;
     bar(y);
-    if (!(0 <= i < N)) break;
     ++i;
+    if (!(0 <= i < N)) break;
   }
 
 In this example, the first early exit guarded by c1 provides safety of indirect access b[x]. As before, it’s required to prove safety of speculative evaluation of c1 and c2. For c1 the same reasoning as for the previous example works. For c2, things are a bit more interesting. Again, to prove safety of c2 speculative evaluation it’s required to prove dereferenceability of b[x], where “frozen” value of x is used (because ‘x’ is also evaluated speculatively). Since freezing of potentially poison value is essentially ‘undef’ value it is impossible to prove dereferenceability of b[x] (without additional tricks which are explained later).
 
-Finally let’s consider a case which requires speculation of potentially faulting instruction. For example, integer division:
+Let us consider a case which requires speculation of potentially faulting instruction. For example, integer division:
+
 
 .. code::
 
@@ -244,13 +250,30 @@ Finally let’s consider a case which requires speculation of potentially faulti
     bool c1 = (z == 1);
     if (c1) break;
     foo(x);
-    if (!(0 <= i < N)) break;
     ++i;
+    if (!(0 <= i < N)) break;
   }
 
-It may seem that it’s safe to vectorize such a loop but it’s not. Even though ‘x/y’ is not explicitly guarded in scalar execution it’s execution still depends on exits following it. Thus, vectorization involves speculation of ‘x/y’ and will immediately produce a fault if speculatively read value (b[i]) appears to be 0. That is, assuming a[0] == b[0] != 0, scalar loop will execute exactly one iteration and exit. If at the same time b[1] == 0, then speculative evaluation of x^/y^ required for vectorization will produce a fault making such vectorization illegal. Such cases of  immediately introducing UB should be identified and bailed out. 
+It may seem that it’s safe to vectorize such a loop but it’s not. Even though ‘x/y’ is not explicitly guarded in scalar execution its execution still depends on exits following it. Thus, vectorization involves speculation of ‘x/y’ and will immediately produce a fault if speculatively read value (b[i]) appears to be 0. That is, assuming a[0] == b[0] != 0, scalar loop will execute exactly one iteration and exit. If at the same time b[1] == 0, then speculative evaluation of x^/y^ required for vectorization will produce a fault making such vectorization illegal. Such cases of  immediately introducing UB should be identified and bailed out. 
 
-!!! TODO: Consider conditions which are dependent on each other and if we were to speculate it for P0, we are effectively `OR`ing all conditions at start of the loop. This can be problematic and hence we need to prove safe speculation (no immediate UB) at that context.
+Finally, let us consider the case similar as above, but this time, we have a div-by-0 check:
+
+.. code::
+
+  while(true) {
+    int x = a[i];
+    int y = b[i];
+    if (y == 0) break;  // Condition C0
+    int z = x/y;
+    bool c1 = (z == 1); // Condition C1
+    if (c1) break;
+    foo(x);
+    ++i;
+    if (!(0 <= i < N)) break;
+  }
+
+Here we have an instruction that causes UB between both the conditions C0 and C1. We can successfully vectorize C0 if we prove that load of array `b` can be safely speculated upto `N` iterations. However, C1 is guarded by C0. To consider speculation of C1 safe, we need to prove it is safe at the context being the start of the loop. 
+
 
 Cost modelling
 ==============
@@ -263,6 +286,7 @@ Live outs
 ==========
 
 The possibility of exiting a loop in the middle of the execution makes it challenging to find out live out values. In case when there are no exits that can break loop’s execution, last scalar iteration maps to the last lane of the last vector iteration. Thus, the live out value can be simply extracted from the last lane right after the vector loop. In the case of presence of dd-exits things are more complicated. Live out value should be extracted from the last lane active at the live out definition. That means two things. First, the last value extraction mask is a disjunction of Pi predicates (gives active vector lanes) under which live out is defined. Second, the last value extraction mask is individual for each live out. Let us try understanding things using the following example: 
+
 
 .. code::
 
@@ -284,6 +308,7 @@ Corresponding live out value should be extracted from the last active lane given
 X = Extract(X^, CLSNZ(EMask(X))) = Extract(X^,  1) = A[0] as expected.
 
 Let us modify previous example so that live out is re-defined at dd-exit block itself:
+
 
 .. code::
 
@@ -312,25 +337,32 @@ EMask(X) = (Pi | … | Pj), where Pi are predicates under which X is defined.
 The Simple Approach
 --------------------
 
-Well, vectorization of loops with dd-exits is challenging task because the loop can be exited from the middle. But what if we make vector code to execute all iterations but the last one where the loop is exited? In other words, we can copy original loop and rewrite it in the form where all original dd-exits are replaced with a single test placed at the very beginning of the loop. If the test passes, continue with the loop body otherwise fall back to the original scalar loop with dd-exits. Let’s see how the described transformation looks like on the first example in this RFC:
+Well, vectorization of loops with dd-exits is challenging task because the loop can be exited from the middle. But what if we make vector code to execute all iterations but the last one where the loop is exited? In other words, we can copy original loop and rewrite it in the form where all original dd-exits are replaced with a single test placed at the very beginning of the loop. If the test passes, continue with the loop body otherwise fall back to the original scalar loop with dd-exits. Let’s see how the described transformation looks like on the predication_example_ from above :
 
 .. code::
 
   i=0;
-  for(i; I < N; ++i) {
-    if(C1) {
-       break;
-    }
-    I0;
-    I2;
-  }
-  for(j = i; j < N; ++j) {
-    I0;
-    if(C1) {
+  if ( i < N) {
+    // Scalar loop which will be vectorized. We have moved all early exits to the start of the loop.
+    do {
+      if (C1) {
+         break;
+      }
+      I0;
+      I1;
+      I2;
+      I++;
+    } while ( i < N);
+
+    // Scalar post loop for executing the remaining iterations when we exit the above loop.
+    for(j = i; j < N; ++j) {
+      I0;
+      if (C1) {
         I1;
         break;
+      }
+      I2;
     }
-    I2;
   }
  
 So, we effectively converted our task of vectorization of a loop with dd-exits into vectorization of a loop with single early dd-exit. Moreover, this single exit can now be “widened” (by analogies of guard widening) since it’s always valid to fall back to the original loop. Let’s see what it takes to vectorize the loop in this form.
@@ -346,12 +378,12 @@ P :sub:`k` :sup:`LOOP` = P0 & ~(C1^| … | Ck^) = P0^ = AllOnes
 
 P :sub:`k` :sup:`EXIT` = P0 & Ck & ~(C1^| … | Ck-1^) = AllZeros
 
-That is, vector body does not need any predication anymore and loop exit blocks just disappear. In other words, the loop is vectorized as if there is no dd-exits except one early exit at the start of the loop. One key point to note here is that this only holds because we satisfy hoistability safety and speculation safety (which we will talk below).
-Here is the vectorized loop with the single-exit vectorized condition:
+That is, vector body does not need any predication anymore and loop exit blocks just disappear. In other words, the loop is vectorized as if there is no dd-exits except one early exit at the start of the loop. One key point to note here is that this only holds because we satisfy hoistability safety and speculation safety (which we will talk below). Here is the vectorized loop with the single-exit vectorized condition:
 
 .. code::
 
   i=0;
+  If ( I < N) {
   for(i^; i^ < N; ++i^) {
     if(anyof(C1^) != 0) {
        break;
@@ -366,6 +398,7 @@ Here is the vectorized loop with the single-exit vectorized condition:
         break;
     }   
     I2; 
+  }
   }
   
 
@@ -397,15 +430,19 @@ Let’s consider the example from figure 7 once again. Assume, ‘b’ is proven
     if (anyof(c1^ | c2^)) break;
     foo(x^);
     bar(y^);
-    if (!(0 <= i < N)) break;
-    i += VF; 
+    i += VF;
+    if (!(0 <= i < N)) break; 
   }
 
 Simple Approach Cost modelling
 ==============================
 
-There is a pretty significant difference in cost modelling between the approaches. In the “general” case each vector instruction should be executed under corresponding predicate while in the “simple” case it is not. So, it’s reasonable to expect that vectorized code will execute faster (or at least not slower) in the latter case. On the other hand, the latter approach requires several scalar iterations in most cases while for the former approach scalar epilogue can be folded into main loop without extra penalty. In practice, it’s reasonable to expect the “simple” approach to outperform the “general” one unless predication is totally free.
-One extra thing to care about is when extra guard(s) is inserted due to speculatability considerations. The open problem about cost modelling with early exit vectorization is that we do not know the actual number of iterations run in the vector loop. This is now magnified.
+There is a pretty significant difference in cost  between the approaches. This is because each approach works better in certain scenarios:
+
+  * The Simple approach is cheaper for the vectorized loop since each vector instruction is not predicated (we have the early vectorized exit at the start of the loop)
+  * The simple approach may require the scalar loop to run several iterations since we exit the vectorized loop when the vectorized early exit fails, while in the general approach we can tail fold the scalar post loop into the vectorized loop.
+
+The main problem with early exit vectorization cost modelling is that we do not know how many iterations are actually run, so the scalar post loop if not tail folded can be running more iterations compared to the vectorized version.
 
 Simple Approach Live-Outs
 =========================
@@ -450,5 +487,3 @@ An approach without changing existing Loop Vectorizer code
 ----------------------------------------------------------
 
 There is one extra consideration not explicitly discussed so far but has potential to drive our choice of the approach to implement. As careful reader has already noted the “simple” approach has very few differences with “normal” vectorization case. That not only makes it simpler to support it in the current vectorizer but opens an opportunity to implement it as a standalone pass. The process looks the following way. First, the original loop is cloned and preprocessed to remove dd-exits and hoist corresponding conditions. Hoisting and speculation safety should be proven before doing that. Next, the resulting cloned loop is passed to the vectorizer. Finally, vectorized loop is postprocessed. During postprocessing an early exit is inserted, and live outs are fixed up to account for new exit. In addition, scalar prologue produced by the vectorizer is substituted with the original scalar loop. Cost estimation should also be corrected because hoisted dd-exit conditions are speculatively executed in the vector version and may be conditionally executed in scalar version. 
-
-
