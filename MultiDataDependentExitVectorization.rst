@@ -6,6 +6,10 @@ Vectorization of loops with multiple exits has always been an attractive but cha
 
 This document is divided into three sections: First, we discuss the general approach to support vectorization when we have data dependent exits, including the formulae for predicates, legality constraints and the cost model. We go through this same discussion in the second part where we identify a simpler approach compared to the general one. Finally, in the very last section, we discuss how we could reduce this simpler approach to just a stand-alone pass run before the loop vectorizer.   
 
+:Authors:
+  Yevgeny Brevnov, 
+  Anna Thomas
+
 .. contents::
 
 Background
@@ -75,7 +79,7 @@ Extract(X^, n) – extract nth lane from vector X^, where vector lanes are numbe
 General Model
 --------------
 
-We now dive into how vectorization will look like when we have multiple exits throughout the loop. 
+We now dive into how vectorization will look like when we have multiple exits throughout the loop. The main idea here is that we predicate all the instructions on the (data dependent) conditions which guard the exits. 
 
 
 Predication
@@ -136,6 +140,51 @@ P :sub:`i` :sup:`LOOP` = P0 & ~(C1^| … | Ci^), for i > 0 && i <= k
 P :sub:`i` :sup:`EXIT` = P0 & Ci & ~(C1^| … | Ci-1^), for i > 0 && i <= k
 
 P :sub:`0` :sup:`LOOP` is a predicate for instructions preceding the first dd-exit. P :sub:`i` :sup:`LOOP` is a predicate for instructions contained in the loop, which dominate the latch, where C1^, …, Ci^ are early exits dominating the instruction. P :sub:`i` :sup:`EXIT` is a predicate for instructions belonging to loop exiting blocks (I.e. these instructions do not dominate the loop latch), where Ci is the exiting condition. In case of nested conditions, resulting condition should be formed by ‘and’ing all enclosing conditions.
+
+This is how the loop will look after we perform vectorization with predication. We should have proved the legality constraints stated earlier: hoistability and speculatability.
+
+.. code::
+
+  i = 0;
+  bool earlyExit = false;
+  if (i < N) {
+    do {
+     // Hoist C1 and vectorize it. No exit at this point.
+     C1^
+
+     // Calculate predicates P0, P1 and P2 based on formulae above.
+     P0 = 2 :sup:`CLSZ(C1^)+1` – 1
+     P1 = P0^ & C1^
+     P2 = P0^ & ~C1^
+
+     // Predicate the vectorized instructions on them.
+     P0: I0^
+     P1: I1^
+     P2: I2^
+
+     // Exit the loop if the predicate is not true anymore.
+     if (!AllOnes(P2)) {
+        earlyExit = true;
+        break;
+     }
+     i += VF;
+    } while (i < (N - N % VF))
+
+    // Scalar epilog which runs if N is not a multiple of VF.
+    if (!earlyExit) {
+      while (i < N) {
+         I0;
+         if(C1) {
+           I1;
+           break;
+         }
+         I2;
+         i++;
+      }
+    }
+  }
+
+The key point to note here is that if we exited the vectorized loop since one of the early exits failed (i.e. ``!AllOnes(P2)``), then we should not run the scalar post loop. We have already completed exactly what is required within the vector loop since the instructions were predicated and the lanes in the ``VF`` where computations shouldn't be done is masked off. 
 
 Hoistability
 ============
@@ -439,8 +488,11 @@ Simple Approach Cost modelling
 
 There is a pretty significant difference in cost  between the approaches. This is because each approach works better in certain scenarios:
 
-  * The Simple approach is cheaper for the vectorized loop since each vector instruction is not predicated (we have the early vectorized exit at the start of the loop)
-  * The simple approach may require the scalar loop to run several iterations since we exit the vectorized loop when the vectorized early exit fails, while in the general approach we can tail fold the scalar post loop into the vectorized loop.
+  - The Simple approach is cheaper for the vectorized loop since each vector instruction is not predicated (we have the early vectorized exit at the start of the loop).
+  - The Simple approach may (very likely) require the scalar epilog loop to run:
+     - If we early exited the vectorized loop, we run upto a maximum of VF iterations
+     - If we did not early exit the vectorized loop, scalar epilog loop is run until we complete all iterations or early exit that loop
+  - In the general approach we can tail fold the scalar post loop into the vectorized loop without any added penalty since vectorized loop already uses predication.
 
 The main problem with early exit vectorization cost modelling is that we do not know how many iterations are actually run, so the scalar post loop if not tail folded can be running more iterations compared to the vectorized version.
 
