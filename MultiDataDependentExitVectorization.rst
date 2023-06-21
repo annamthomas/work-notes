@@ -2,9 +2,9 @@
 MultiExit Loop Vectorization
 -------------------------------------------------
 
-Vectorization of loops with multiple exits has always been an attractive but challenging task. The last attempt to improve the situation with handling multi-exit loops in general and data-dependent exit loops in particular was taken by Philip several years ago. Here is a corresponding discussion on llvm-dev list https://lists.llvm.org/pipermail/llvm-dev/2019-September/134998.html and Philip’s notes on github https://github.com/preames/public-notes/blob/master/multiple-exit-vectorization.rst. The goal of this write-up is to kick-off a discussion which should finally define our vision and achieve progress in this critical but difficult task.
+Vectorization of loops with multiple exits has always been an attractive but challenging task. The last attempt to improve the situation with handling multi-exit loops in general and data-dependent exit loops in particular was taken by Philip several years ago. Here is a corresponding discussion on llvm-dev list https://lists.llvm.org/pipermail/llvm-dev/2019-September/134998.html and Philip’s notes on github https://github.com/preames/public-notes/blob/master/multiple-exit-vectorization.rst. The goal of this write-up is to kick-off a discussion which should helpfinally define our vision and achieve progress in this critical but difficult task.
 
-This document is divided into three sections: First, we discuss the general approach to support vectorization when we have data dependent exits, including the formulae for predicates, legality constraints and the cost model. We go through this same discussion in the second part where we identify a simpler approach compared to the general one. Finally, in the very last section, we discuss how we could reduce this simpler approach to just a stand-alone pass run before the loop vectorizer.   
+This document is divided into multiple sections: First, we discuss the general approach to support vectorization when we have data dependent exits, including the formulae for predicates, legality constraints and the cost model. We go through this same discussion in the second part where we identify a variant of the general approach which does not need predication. 
 
 :Authors:
   Yevgeny Brevnov, 
@@ -14,6 +14,8 @@ This document is divided into three sections: First, we discuss the general appr
 
 Background
 ------------
+
+Credit: Major part of this section is taken from Philip Reames Background section from the link above.
 
 The loop vectorizer currently handles single exit loops, where the exit is from the latch. If we have early exits from the loop, then we cannot vectorize the loop. Here is an example, we currently vectorize. 
 
@@ -104,7 +106,7 @@ As it was mentioned vectorization of loops with dd-exits assumes dealing with po
      } while (i < N);
    }
 
-Let’s also assume C1 is 0 for the first iteration and 1 for the second one. Please note that C1 is not evaluated for the remaining iterations in scalar execution thus effectively making it ‘undef’. Now let’s see what values predicates should take if we want to execute it in vector form: 
+Let us also assume C1 is 0 for the first iteration and 1 for the second one. Please note that C1 is not evaluated for the remaining iterations in scalar execution thus effectively making it ‘undef’. Now let’s see what values predicates should take if we want to execute it in vector form: 
 
 .. code::
 
@@ -131,7 +133,7 @@ That is, P0 gives active vector lanes at the beginning of vector iteration, whil
 
 We refer to these two properties as “hoistability” and “speculatability” respectively throughout the document and will be discussed in detail later.
 
-It’s not hard to see (proof by induction: details can be provided if needed) how formulas are generalized to an arbitrary number ‘k’ of early exits:
+It is not hard to see (proof by induction: details can be provided if needed) how formulas are generalized to an arbitrary number ‘k’ of early exits:
 
 P :sub:`0` :sup:`LOOP` = 2 :sup:`CLSZ(C1^|…| Ck^)+1` – 1
 
@@ -153,22 +155,22 @@ This is how the loop will look after we perform vectorization with predication. 
      C1^
 
      // Calculate predicates P0, P1 and P2 based on formulae above.
-     P0 = 2 :sup:`CLSZ(C1^)+1` – 1
-     P1 = P0^ & C1^
-     P2 = P0^ & ~C1^
+     P0^ = 2 :sup:`CLSZ(C1^)+1` – 1
+     P1^ = P0^ & C1^
+     P2^ = P0^ & ~C1^
 
      // Predicate the vectorized instructions on them.
-     P0: I0^
-     P1: I1^
-     P2: I2^
+     P0^: I0^
+     P1^: I1^
+     P2^: I2^
 
      // Exit the loop if the predicate is not true anymore.
      if (!AllOnes(P2)) {
         earlyExit = true;
         break;
      }
-     i += VF;
-    } while (i < (N - N % VF))
+     i^ += VF;
+    } while (i < N - N % VF)
 
     // Scalar epilog which runs if N is not a multiple of VF.
     if (!earlyExit) {
@@ -184,7 +186,7 @@ This is how the loop will look after we perform vectorization with predication. 
     }
   }
 
-The key point to note here is that if we exited the vectorized loop since one of the early exits failed (i.e. ``!AllOnes(P2)``), then we should not run the scalar post loop. We have already completed exactly what is required within the vector loop since the instructions were predicated and the lanes in the ``VF`` where computations shouldn't be done is masked off. 
+The key point to note here is that if we exited the vectorized loop since one of the early exits failed (i.e. ``!AllOnes(P2)``), then we should not run the scalar post loop. We have already completed exactly what is required within the vector loop since the instructions were predicated and the lanes in the ``VF`` where computations should not be done is masked off. 
 
 Hoistability
 ============
@@ -192,7 +194,7 @@ Hoistability
 As we already know, vector instructions should be executed under corresponding predicates that depend on ALL conditions guarding dd-exits. That means we should hoist all such conditions (and their definitions) to the very beginning.  Of course, such hoisting should not break semantic correctness. Let’s give formal definition of hoisting safety: 
 
 Hoisting Safety
-  We say it’s safe to hoist instruction to an earlier point in the execution if it produces the same result as in the original execution and early result availability doesn’t cause observable change in the program behavior. 
+  We say it is safe to hoist instruction to an earlier point in the execution if it produces the same result as in the original execution and early result availability doesn’t cause observable change in the program behavior. 
 
 Typical examples of unsafe instruction hoisting are moving a load ahead of potentially aliasing store or scheduling potentially throwing instruction ahead of another side-effecting instruction. In LLVM terms, this is very similar to ``llvm::canSinkOrHoistInst`` used in LICM along with avoiding hoisting over instructions that fail ``isGuaranteedToTransferExecutionToSuccessor`` (for example, may Throw calls or returns). Note that we can still hoist over throwing calls if we prove the instruction we are hoisting is speculatable (see below). 
 
@@ -211,7 +213,7 @@ One intuitive way to this about this is to take the scalar loop with the data de
 
 An obvious candidate for proving speculation safety are loads from memory. This is because with multi-exit loop vectorization, we can now perform loads from memory that will cause undefined behaviour if we try to read from memory that is not derefenceable. Other examples where we need to prove speculation safety is if we load or introduce a poison value in the vectorized code and cause immediate UB (by using that poison value), while in the scalar form, we exited the loop before the use of poison. For example, adding two values where we have NoWrapFlags. If in the vectorized form, we speculatively execute this add and we wrap-around, the result of the add is a poison value. If we end up branching on that poison value, we introduce undefined behaviour (UB).  
 
-We make a distinction between immediate undefined behaviour and deferred UB. In speculation, immediate UB (loading non-dereferenceable memory or a div-by-0) should be identified and we should bail out of vectorization. However, deferred UB is poison and is handled through `freeze`.
+We make a distinction between immediate undefined behaviour and deferred UB. In speculation, immediate UB (loading non-dereferenceable memory or a div-by-0) should be identified and we should bail out of vectorization. However, deferred UB is poison and is handled through ``freeze``.
 
 Let us consider several examples to better understand what “speculation safety” means.  We start with a classical search loop example but written in a bottom tested form (which is the form expected in loop vectorizer): 
 
@@ -231,27 +233,26 @@ Let us consider several examples to better understand what “speculation safety
 
 This loop has a single dd-exit guarded by condition ‘c’.  Let’s for simplicity assume array ‘a’ has byte-wide elements with first zero element at position M = N/2, where N mod 2. This way scalar loop will not access anything beyond a[M]. To vectorize this loop it should be safe to evaluate ‘a[i]’ for up to VF bytes beyond memory read on previous vector iteration. Thus, it should be valid to dereference up to VF bytes beyond that accessed in scalar execution. Fortunately, there is another condition “!(0 <= i < N)” guaranteeing vector loop will not try to load more than N bytes from the start of ‘a’ (assuming “VF mod 2” && VF <= N). Thus, it is enough to prove there is N bytes dereferenceable from start of ‘a’.
 
-In addition to dereferenceability aspect, poison values may appear as a result of speculative reads. Since these speculatively read values are used as a branch condition later it can produce undefined behavior. This means each speculatively evaluated condition should be ‘frozen’.  To prove the legality of “freezing” it’s enough to show that predicates do not change after freezing. Here is how frozen predicates look like:
+In addition to dereferenceability aspect, poison values may appear as a result of speculative reads. Since these speculatively read values are used as a branch condition later it can produce undefined behavior. This means each speculatively evaluated condition should be ‘frozen’.  To prove the legality of “freezing” it is enough to show that predicates do not change after freezing. Here is how frozen predicates look like:
 
-P :sub:`0` :sup:`LOOP` = 2 :sup:`CLSZ(freeze(C1^)|…| freeze(Cn^))+1` – 1
+P :sub:`0` :sup:`LOOP` = 2 :sup:`CLSZ(freeze(C1^)|…| freeze(Cn^))+1`
 
 P :sub:`i` :sup:`LOOP` = P0 & ~(freeze(C1^)| … | freeze(Ci^)), for i > 0
 
 P :sub:`i` :sup:`EXIT` = P0 & Ci & ~(freeze(C1^)| … | freeze(Ci-1^)), for i > 0 
 
-If loaded value is poison, ‘freeze’ of that value can be replaced with ‘undef’. Otherwise, it is any value in the given type that is semantically equal to ‘undef’ as well. Thus, we can model speculatively loaded values with ‘undef’. Let’s assume we take exit ‘k’ on iteration ‘m’. Thus dd-exit conditions have the following values after freezing:
- 
-Ci = [0 :sub:`1`, …0 :sub:`m-1`, 0 :sub:`m`,         undef :sub:`m+1`, …, undef :sub:`n` ], for i < k
+First let us see where we can have poison values. Assume we take exit ``k`` on iteration ``m``.
 
-Ci = [0 :sub:`1`, …0 :sub:`m-1`, 1 :sub:`m`,         undef :sub:`m+1` , …, undef :sub:`n` ], for i == k
+If a poison value occured before iteration ``m`` or at condition ``k-1`` at iteration ``m``, this means we were branching on poison in the scalar program (i.e. we had undefined behavior). We are free to do anything with a program that has UB.
 
-Ci = [0 :sub:`1`, …0 :sub:`m-1`, undef :sub:`m` , undef :sub:`m+1`, …, undef :sub:`n` ], for i > k
+Hence, we need to only consider what happens when we have poison on condition C :sub:`k+1` at iteration ``m`` or at iterations greater than ``m``. We call these potentially poison conditions. The poison value has no effect because they do not change the value of the predicate calculated. Consider P :sub:`0` :sup:`LOOP` :
+  - We are generating an ``OR`` of the conditions and there is no poison value before iteration ``m``.
+  - We are calculating ``CLSZ`` of these OR'ed conditions, which counts the least significant zeroes. All poison values appear after the first ``1`` (i.e. taken condition).
 
-This means ``C0 | … | Cm`` == ``freeze(C0) | … | freeze(Cm)``. Thus ``CLSZ(C1^|…| Cn^)`` == ``CLSZ(freeze(C1^)|…| freeze(Cn^))``.
+So P :sub:`0` :sup:`LOOP` does not change after freezing. Since P :sub:`I` :sup:`LOOP` and P :sub:`I` :sup:`EXIT` use similar ``OR`` conditions, they do not change either after freezing. More theoretical proof is available here [#freezeproof]_.
 
-So P :sub:`0` :sup:`LOOP` doesn’t change after freezing. Since P :sub:`0` :sup:`LOOP` hasn’t changed, it’s easy to see that P :sub:`I` :sup:`LOOP` and P :sub:`I` :sup:`EXIT` do not change either.
 
-Summarizing we end up with the following vector loop (we avoid showing the scalar post loop for convenience):
+Summarizing we end up with the following predicated vector loop (we avoid showing the scalar post loop for convenience):
 
 
 .. code::
@@ -261,14 +262,21 @@ Summarizing we end up with the following vector loop (we avoid showing the scala
    do {
     char x^ = a^;
     char x1^ = freeze(x^)
-    bool c^ = (x1^ == 0^);
-    if (anyof(c^)) break;
-    foo^(x^);
+    bool C^ = (x1^ == 0^);
+    // Calculate the vectorized predicates.
+    P0^ = 2 :sup:`CLSZ(C^)+1` – 1;
+    P_end_loop^ = P0^ & ~C^;
+    // The statements after C should be predicated with P_end_loop^.
+    P_end_loop^: foo^(x^);
+
+    if (!AllOnes(P_end_loop^)) break;
     i += VF;
    } while ( i < N);
   }
 
 Let us consider a bit more complicated example involving indirect memory access:
+
+.. _indirect_memory_access:
 
 .. code::
 
@@ -321,14 +329,14 @@ Finally, let us consider the case similar as above, but this time, we have a div
     if (!(0 <= i < N)) break;
   }
 
-Here we have an instruction that causes UB between both the conditions C0 and C1. We can successfully vectorize C0 if we prove that load of array `b` can be safely speculated upto `N` iterations. However, C1 is guarded by C0. To consider speculation of C1 safe, we need to prove it is safe at the context being the start of the loop. 
+Here we have an instruction that causes UB between both the conditions C0 and C1. We can successfully vectorize C0 if we prove that load of array `b` can be safely speculated upto `N` iterations. However, C1 is guarded by C0. To consider speculation of C1 safe, we need to prove it is safe at the context being the start of the loop. In this case, we cannot prove it is safe. 
 
 
 Cost modelling
 ==============
 
 Cost modelling is an easy and hard task at the same time. On the one hand, it’s easy because existing implementation can already handle predicated execution and dd-exit vectorization case seems to be well covered by that. Special handling will be needed for cost estimation of dd-exit conditions that are hoisted and speculatively evaluated for entire lane in the vector execution while they can be conditionally evaluated in the scalar execution. 
-On the other hand, it’s hard to accurately predict the real number of iterations in the loop since each dd-exit can exit the loop (I.e. it may run much lower than estimated number of iterations).  
+On the other hand, it is hard to accurately predict the real number of iterations in the loop since each dd-exit can exit the loop (I.e. it may run much lower than estimated number of iterations).  
  
 
 Live outs 
@@ -400,7 +408,7 @@ Well, vectorization of loops with dd-exits is challenging task because the loop 
       I0;
       I1;
       I2;
-      I++;
+      i++;
     } while ( i < N);
 
     // Scalar post loop for executing the remaining iterations when we exit the above loop.
@@ -414,12 +422,12 @@ Well, vectorization of loops with dd-exits is challenging task because the loop 
     }
   }
  
-So, we effectively converted our task of vectorization of a loop with dd-exits into vectorization of a loop with single early dd-exit. Moreover, this single exit can now be “widened” (by analogies of guard widening) since it’s always valid to fall back to the original loop. Let’s see what it takes to vectorize the loop in this form.
+So, we effectively converted our task of vectorization of a loop with dd-exits into vectorization of a loop with single early dd-exit. 
 
 Simple Approach Predication
 ===========================
 
-Let’s see how predicates change under C1^| … | Cn^ == 0 assumption:
+Let us see how predicates change under C1^| … | Cn^ == 0 assumption:
 	
 P :sub:`0`  = 2 :sup:`CLSZ(C1^| .. | Cn^)+1` – 1 = 2 :sup:`VF+1` – 1 = AllOnes
 
@@ -432,45 +440,58 @@ That is, vector body does not need any predication anymore and loop exit blocks 
 .. code::
 
   i=0;
-  If ( I < N) {
-  for(i^; i^ < N; ++i^) {
+  if ( i < N) {
+  do {
+    // Compute vectorized condition C1^
     if(anyof(C1^) != 0) {
        break;
-    }   
+    }
+    // No predicates required since we early exit the 
+    // loop at the start of vectorized iteration.
     I0^;
     I2^;
-  }
-  for(j=i^[VF]; j < N; ++j) {
-    I0; 
-    if(C1) {
-        I1; 
-        break;
-    }   
-    I2; 
-  }
-  }
-  
+    i += VF;
+  } while (i < N - N % VF);
 
+  // Scalar epilog which will run if we early exit the loop OR 
+  // if there are remainder iterations when N does not evenly divide VF.
+  // In either case, we already have the correct value of IV `i` (incremented by VF) 
+  // to resume the scalar loop.
+  while (i < N) {
+    I0;
+    if(C1) {
+      I1; 
+      break;
+    }   
+    I2;
+    i++; 
+   }
+  }
+
+The key point here is unlike the general approach the scalar post loop will need to run if we early exit the loop as we do not have predication. However, this also gives us a neat way to insert additional guards since it is 
+since it is always valid to fall back to the scalar loop. 
 
 Simple Approach Hoistability
 ============================
 
-The general approach required hoisting safety for all conditions guarding dd-exits. The simplified approach doesn’t impose any new requirements. So hoistability requirement for dd-exit conditions remains the same. In the above example, if I0 is `c[i] = a[i] + b [i]` and  C1 is `if (c[i] < X)`, then we cannot *safely hoist* C1 before I0.
+The general approach required hoisting safety for all conditions guarding dd-exits. The simplified approach does not impose any new requirements. So hoistability requirement for dd-exit conditions remains the same. In the above example, if I0 is `c[i] = a[i] + b [i]` and  C1 is `if (c[i] < X)`, then we cannot *safely hoist* C1 before I0.
 
 
 Simple approach Speculatability
 ===============================
-Instead of building P0, P1, … predicates this approach requires evaluation of `anyof(C1^| .. | Cn^)` at the beginning of the loop. So, it still should be valid to safely speculate dd-exiting conditions. Fortunately, “freezing” technique still works here. Indeed, since ‘poison’ value can only appear at the exiting vector iteration, the loop can’t be exited at earlier iterations. At the same time if some dd-exit guarded by Ci is taken on iteration ‘m’ (will have ‘1’ at position ‘m’), then `anyof(freeze(C1^)| .. | freeze(Cn^))` will be evaluated to ‘1’ as well because disjunction of ‘1’ with ‘undef’ gives ‘1’ and the exit will be taken as well. 
+Instead of building P0, P1, … predicates this approach requires evaluation of ``anyof(C1^| .. | Cn^)`` at the beginning of the loop. So, it still should be valid to safely speculate dd-exiting conditions. Fortunately, “freezing” technique still works here. Indeed, since ‘poison’ value can only appear at the exiting vector iteration, the loop does not exit at earlier iterations. At the same time if some dd-exit guarded by Ci is taken on iteration ‘m’ (will have ‘1’ at position ‘m’), then ``anyof(freeze(C1^)| .. | freeze(Cn^))`` will be evaluated to ‘1’ and we exit the loop before we branch on poison (thereby avoiding UB being introduced in the vectorized version).
 
-Despite apparent similarity there is one important difference between the approaches. Namely, in the “simplified” approach, it’s always safe to exit vector loop earlier and continue with the scalar loop. That gives us an opportunity to insert extra guards that weren’t present in the original loop to prove speculation safety.
-Let’s consider the example from figure 7 once again. Assume, ‘b’ is provenly dereferenceable in the range from 0 to M. Then all we need to do is to simply guard ‘b[x]’ by checking that x is in the range from 0 to M condition. If we can prove that M == K then c1 can be eliminated from the later guard. 
+Despite apparent similarity there is one important difference between the approaches. Namely, in the “simplified” approach, it is always safe to exit vector loop earlier and continue with the scalar loop. That gives us an opportunity to insert extra guards that were not present in the original loop to prove speculation safety.
+Let us consider the example about indirect_memory_access_ once again. Assume, ‘b’ is provenly dereferenceable in the range from 0 to M. Then all we need to do is to simply guard ‘b[x]’ by checking that x is in the range from 0 to M condition. If we can prove that M == K then c1 can be eliminated from the later guard. 
 
 .. code::
 
-  while(true) {
-    int x^ = a^; 
+  if (i < N) {
+   do {
+    int x^ = a[i^]; 
     int x1^ = freeze(x^);
-    bool c3^ = (0^ <=x1^ < M^);
+    // Inserted this runtime check for speculating `b`.
+    bool c3^ = (0^ <= x1^ < M^);
     if (anyof(c3^)) break;
     char y^ = b^[x^];
     char y1^ = freeze(y);
@@ -480,8 +501,26 @@ Let’s consider the example from figure 7 once again. Assume, ‘b’ is proven
     foo(x^);
     bar(y^);
     i += VF;
-    if (!(0 <= i < N)) break; 
+   } while(i < N - N % VF);
+
+   // Scalar epilog loop (this will definitely execute if we exit the loop early).
+   // Note that we do not insert any runtime check here. If we were to access 
+   // unmapped memory in array b, this would happen in the original scalar loop as well.
+   if (i < N) {
+    int x = a[i];
+    bool c1 = (0 <=x < K);
+    if (c1) break;
+    foo(x);
+    char y = b[x];
+    bool c2 = (y == 0);
+    if (c2) break;
+    bar(y);
+    ++i;
+   }
   }
+
+Note that this same approach can be used when a following condition can only be speculated at the context where the previous condition passed (i.e. we cannot use OR'ing of all conditions together). 
+
 
 Simple Approach Cost modelling
 ==============================
@@ -505,8 +544,61 @@ EMask(X) = (Pi | … | Pj) = AllOnes
 
 X = Extract(X^, CLSNZ(EMask(X))) = X = Extract(X^, VF))
 
-Expectedly, live outs should be calculated the same way as during “normal” vectorization, I.e. we extract the last lane of the last vectorized iteration.
+Expectedly, live outs should be calculated the same way as during “normal” vectorization, I.e. we extract the last lane of the last vectorized iteration. One exception to this is when the live-out is part of the condition that makes up a data dependent exit. 
 
+.. code::
+
+  i = 0;
+  do {
+   Y = a[i];
+   C1 = Y < X;
+   if (C1) {
+     break;
+   }
+   I0;
+   I1;
+   I2;
+   i++;
+  } while ( i < N);
+  print(Y);
+
+When we vectorize this loop above, if we were to exit through the vectorized condition: ``anyof(c1)``, we do not know the actual value of ``Y`` which caused the loop to exit. The above statement of extracting from the last lane of the last vectorized iteration remains true only if the live-out definition is after the early exit condition in the original scalar loop. The vectorized version with live-out would look like:
+
+.. code::
+
+  do {
+   // This is [i, i + 1, .., i + VF - 1]
+   vectorized_IV = i^; 
+   Y = a[vectorized_IV];
+   Y_freeze = freeze(Y);
+   C1 = Y_Freeze < X;
+   if (C1)
+     break;
+   I0;
+   I1;
+   I2;
+   i += VF;
+  } while ( i < N - N % VF);
+
+  // Scalar epilog loop: this will run upto maximum of VF iterations if early_exit is true 
+  // or it runs several (remainder) iterations if we exited normally through the vectorized loop. 
+  while ( i < N) {
+   I0;
+   Y_scalar = a[i];
+   if (Y_scalar < X) 
+     break;
+   I1;
+   I2;
+   j++;
+  }
+  
+  // The only way for chosing the element from the vectorized loop would be if N evenly divides the loop
+  // and we did not exit the vectorized loop early. This would mean we completed all vectorized 
+  // iterations (same as "normal vectorization" today)
+  y_phi = phi [Y_scalar, epilog loop], [ VFth element from vector Y_freeze, vectorized_loop]
+  print(y_phi)
+
+Note that even if we "early exit" the vectorized loop in the last vectorized iteration, we will enter the scalar epilog and compute the correct Y_scalar.
 
 
 “General” vs. “Simple” approaches
@@ -515,27 +607,49 @@ Expectedly, live outs should be calculated the same way as during “normal” v
 There are 5 focus areas that have been discussed in regard to dd-exiting loops vectorization: predication, live outs, hoistability, speculatability and cost modeling. Let’s see what it will take to support each of them for both approaches.
 
 “General” vs. “Simple”: Predication
-   One of the main differences is how predication should be handled. The “general” approach requires full predication. Fortunately, current implementation already has support for the predication so it should not be a big deal.
+   One of the main differences is how predication should be handled. The “general” approach requires full predication. Fortunately, current implementation already has support for the predication.
 
 
 “General” vs. “Simple”: Hoistability
-  Hoist safety analysis is the same in both cases and not a big deal since it has already been implemented in other part of the compiler.
+  Hoist safety analysis is the same in both cases and it has already been implemented in other part of the compiler.
 
 “General” vs. “Simple”: Speculatability
   Speculation safety analysis is one of the most important things from practical point of view because many real life examples involve loads speculation. An ability to insert extra guards in the “simple” approach can be critical. We can start with speculatability of primitive arrays and those without indirect memory accesses. It boils down to proving dereferencability of the array within the maximum iterations executed within the vector loop. There are couple of ways to do this:
 
 * if the array is statically allocated with K bytes, then we know we need the vectorized loop to stop at min(K, N).  
-* If the array is dynamically allocated using an allocation function, we can rely on the allocsize attribute to form a dynamic check for the vectorized loop.
+* If the array is dynamically allocated using an allocation function, we can rely on the ``allocsize`` attribute to form a dynamic check for the vectorized loop.
 * If there is an existing check that the array is accessed up to N elements in the loop and there is a dereferenceable attribute on the start of the array, we can use this fact to ensure that we will never vectorize past the dereferenceable bytes.
 
 “General” vs. “Simple”: Cost model
-	Even though estimated cost may differ significantly for the two cases it’s not expected to require much implementation efforts. 
+	Even though estimated cost may differ significantly for the two cases it is not expected to require much implementation efforts. 
 
 “General” vs. “Simple”: Live outs
-   The critical difference is in live outs support. The “general” approach requires special handling of exit blocks (either through predication or explicit control flow) and tracking of last value extraction mask for each live-out individually. The “simple” approach doesn’t require any extra efforts comparing to “normal” case because live outs are naturally handled by scalar post loop.
+   The critical difference is in live outs support. The “general” approach requires special handling of exit blocks (either through predication or explicit control flow) and tracking of last value extraction mask for each live-out individually. The “simple” approach does not require any extra efforts comparing to “normal” case because live outs are naturally handled by scalar post loop.
 
 
 An approach without changing existing Loop Vectorizer code
 ----------------------------------------------------------
 
 There is one extra consideration not explicitly discussed so far but has potential to drive our choice of the approach to implement. As careful reader has already noted the “simple” approach has very few differences with “normal” vectorization case. That not only makes it simpler to support it in the current vectorizer but opens an opportunity to implement it as a standalone pass. The process looks the following way. First, the original loop is cloned and preprocessed to remove dd-exits and hoist corresponding conditions. Hoisting and speculation safety should be proven before doing that. Next, the resulting cloned loop is passed to the vectorizer. Finally, vectorized loop is postprocessed. During postprocessing an early exit is inserted, and live outs are fixed up to account for new exit. In addition, scalar prologue produced by the vectorizer is substituted with the original scalar loop. Cost estimation should also be corrected because hoisted dd-exit conditions are speculatively executed in the vector version and may be conditionally executed in scalar version. 
+
+Conclusion
+----------
+
+We talk about two different approaches to handle data dependent exit loop vectorization and go over how to handle major aspects of legality, functionality and cost model in each approach. Each approach has different motivations such as the general approach works best when predication is cheap. There are couple of open questions such as:
+
+* how we would identify loops where this sort of vectorization is not profitable (both approaches are affected by this, but the penalty touches different aspects)
+
+* General speculatability is a hard problem. Different languages provide some notion of array length which can be used to generate a check added within the loop.
+
+Footnotes
+---------
+
+.. [#freezeproof] If we define ``fp`` as ``freeze(poison)``, any potentially poison condition can have this value. So, we have the following conditions after we freeze:
+
+  Ci = [0 :sub:`1`, …0 :sub:`m-1`, 0 :sub:`m`,         fp :sub:`m+1`, …, fp :sub:`n` ], for i < k
+
+  Ci = [0 :sub:`1`, …0 :sub:`m-1`, 1 :sub:`m`,         fp :sub:`m+1` , …, fp :sub:`n` ], for i == k
+
+  Ci = [0 :sub:`1`, …0 :sub:`m-1`, fp :sub:`m` , fp :sub:`m+1`, …, fp :sub:`n` ], for i > k
+
+  This means ``C0 | … | Cm`` == ``freeze(C0) | … | freeze(Cm)``. Thus ``CLSZ(C1^|…| Cn^)`` == ``CLSZ(freeze(C1^)|…| freeze(Cn^))``.
