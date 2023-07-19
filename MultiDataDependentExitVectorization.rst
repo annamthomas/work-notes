@@ -511,7 +511,7 @@ EMask(X) = (Pi | … | Pj) = AllOnes
 
 X = Extract(X^, CLSNZ(EMask(X))) = X = Extract(X^, VF))
 
-Expectedly, live outs should be calculated the same way as during “normal” vectorization, I.e. we extract the last lane of the last vectorized iteration. One exception to this is when the live-out is part of the condition that makes up a data dependent exit. 
+Expectedly, live outs should be calculated the same way as during “normal” vectorization, I.e. we extract the last lane of the last "completely" vectorized iteration. We add this term "completely" vectorized iteration because if we were to exit the vectorized loop during the vectorized early exit check, that is not considered a completed vectorized iteration. As an example, consider a live-out which is part of the condition that makes up a data dependent exit:
 
 .. code::
 
@@ -529,7 +529,7 @@ Expectedly, live outs should be calculated the same way as during “normal” v
   } while ( i < N);
   print(Y);
 
-When we vectorize this loop above, if we were to exit through the vectorized condition: ``anyof(c1)``, we do not know the actual value of ``Y`` which caused the loop to exit. The above statement of extracting from the last lane of the last vectorized iteration remains true only if the live-out definition is after the early exit condition in the original scalar loop. The vectorized version with live-out would look like:
+When we vectorize this loop above, if we were to exit through the vectorized condition: ``anyof(c1)``, we do not know the actual value of ``Y`` which caused the loop to exit. The last iteration where we failed the exit condition is not a fully vectorized iteration (since we exited the loop).  The vectorized version with live-out would look like:
 
 .. code::
 
@@ -551,6 +551,7 @@ When we vectorize this loop above, if we were to exit through the vectorized con
   // or it runs several (remainder) iterations if we exited normally through the vectorized loop. 
   while ( i < N) {
    I0;
+   // This resume value is the "VF'th" value in last "completed" vectorized iteration.
    Y_scalar = a[i];
    if (Y_scalar < X) 
      break;
@@ -564,8 +565,6 @@ When we vectorize this loop above, if we were to exit through the vectorized con
   // iterations (same as "normal vectorization" today)
   y_phi = phi [Y_scalar, epilog loop], [ VFth element from vector Y_freeze, vectorized_loop]
   print(y_phi)
-
-Note that even if we "early exit" the vectorized loop in the last vectorized iteration, we will enter the scalar epilog and compute the correct Y_scalar.
 
 
 “General” vs. “Simple” approaches
@@ -621,7 +620,7 @@ Let us consider the example about indirect_memory_access_ once again. Assume, �
 
 Note that this same approach can be used when a following condition can only be speculated at the context where the previous condition passed (i.e. we cannot use OR'ing of all conditions together). 
 
-  Speculation safety analysis is one of the most important things from practical point of view because many real life examples involve loads speculation. An ability to insert extra guards in the “simple” approach can be critical.
+Speculation safety analysis is one of the most important things from practical point of view because many real life examples involve loads speculation. An ability to insert extra guards in the “simple” approach can be critical.
 
 “General” vs. “Simple”: Cost model
 	Even though estimated cost may differ significantly for the two cases it is not expected to require much implementation efforts. 
@@ -644,12 +643,4 @@ We talk about two different approaches to handle data dependent exit loop vector
 
 * General speculatability is a hard problem. Different languages provide some notion of array length which can be used to generate a check added within the loop.
 
-Footnotes
----------
-------- Do we have a proper place/need for this? ----------
- We can start with speculatability of primitive arrays and those without indirect memory accesses. It boils down to proving dereferencability of the array within the maximum iterations executed within the vector loop. There are couple of ways to do this:
 
-* if the array is statically allocated with K bytes, then we know we need the vectorized loop to stop at min(K, N).  
-* If the array is dynamically allocated using an allocation function, we can rely on the ``allocsize`` attribute to form a dynamic check for the vectorized loop.
-* If there is an existing check that the array is accessed up to N elements in the loop and there is a dereferenceable attribute on the start of the array, we can use this fact to ensure that we will never vectorize past the dereferenceable bytes.
-------------------------------------------------------------
