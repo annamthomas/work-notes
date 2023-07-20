@@ -249,7 +249,7 @@ First let us see where we can have poison values. Assume we take exit ``K`` on i
 
   Ci = [0 :sub:`i,1`, …0 :sub:`i,M-1`, freeze(c :sub:`i,M`),  freeze(c :sub:`i,M+1`), …, freeze(c :sub:`i,N`) ], for i > K
 
-It's easy to see that ``c :sub: `0,j` | … | c :sub: `K,j``` == ``freeze(c :sub: `0,j`) | … | freeze(c :sub: `K,j`)`` for any ``j`` less or equal ``M``. Thus ``CLSZ(C1^|…| Cn^)`` == ``CLSZ(freeze(C1^)|…| freeze(Cn^))`` because first non zero value remains at positions ``M`` (remaining poison values doesn't affect resutl of ``CLSZ`` by definition) , so P :sub: `0` :sup: `LOOP` does not change after freezing. Since P :sub: `0` :sup: `LOOP` has not changed, its easy to see that P :sub: `i` :sup: `LOOP` and P :sub: `0` :sup: `EXIT` do not change either.
+It's easy to see that c :sub:`0,j` | … | c :sub:`K,j` == freeze(c :sub:`0,j`) | … | freeze(c :sub:`K,j`) for any ``j`` less or equal ``M``. Thus CLSZ(C1^|…| Cn^) == CLSZ(freeze(C1^)|…| freeze(Cn^)) because first non zero value remains at positions ``M``, so P :sub:`0` :sup:`LOOP` does not change after freezing. Since P :sub:`0` :sup:`LOOP` has not changed, its easy to see that P :sub:`i` :sup:`LOOP` and P :sub:`i` :sup:`EXIT` do not change either.
 
 Here is informal way to show safety of using 'freeze' instruction for our purpose.  If a poison value occured before iteration ``M`` or at condition ``K-1`` at iteration ``M``, this means we were branching on poison in the scalar program (i.e. we had undefined behavior). We are free to do anything with a program that has UB.
 
