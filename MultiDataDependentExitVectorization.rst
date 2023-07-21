@@ -1,10 +1,10 @@
 -------------------------------------------------
-MultiExit Loop Vectorization
+Vectorization of loops with data dependent exits
 -------------------------------------------------
 
-Vectorization of loops with multiple exits has always been an attractive but challenging task. The last attempt to improve the situation with handling multi-exit loops in general and data-dependent exit loops in particular was taken by Philip several years ago. Here is a corresponding discussion on llvm-dev list https://lists.llvm.org/pipermail/llvm-dev/2019-September/134998.html and Philip’s notes on github https://github.com/preames/public-notes/blob/master/multiple-exit-vectorization.rst. The goal of this write-up is to kick-off a discussion which should help finally define our vision and achieve progress in this critical but difficult task.
+Vectorization of loops with multiple exits and loops with data dependent exits (dd-exit) in particular has always been an attractive but challenging task. The last attempt to improve the situation was taken by Philip several years ago. Here is a corresponding discussion on llvm-dev list https://lists.llvm.org/pipermail/llvm-dev/2019-September/134998.html and Philip’s notes on github https://github.com/preames/public-notes/blob/master/multiple-exit-vectorization.rst. The goal of this write-up is to kick-off a discussion which should help finally define our vision and achieve progress in this critical but difficult task.
 
-This document is divided into multiple sections: First, we discuss the general approach to support vectorization when we have data dependent exits, including the formulae for predicates, legality constraints and the cost model. We go through this same discussion in the second part where we identify a variant of the general approach which does not need predication. 
+This document is divided into multiple sections: First, we discuss the “full predication” approach to support vectorization when we have dd-exits, including the formulae for predicates, legality constraints and the cost model. We go through this same discussion in the second part where we identify a variant of the “full predication” approach which does not need predication. 
 
 :Authors:
   Yevgeny Brevnov, 
@@ -17,7 +17,7 @@ Background
 
 Credit: Major part of this section is taken from Philip Reames Background section from the link above.
 
-The loop vectorizer currently handles single exit loops, where the exit is from the latch. If we have early exits from the loop, then we cannot vectorize the loop. Here is an example, we currently vectorize. 
+Currently, the loop vectorizer handles single exit loops, where the exit is from the latch. In addition, it is able to vectorize multi-exit loops with computable exits. If we have early dd-exit from the loop, then we cannot vectorize the loop. Here is an example, we currently vectorize. 
 
 .. code::
 
@@ -40,14 +40,14 @@ In addition, the loop vectorizer has support for internal predication.  That is,
 
 There are two kinds of early exits from the loop:
 
-* A regular early exit where there is no dependence of value loaded from memory. For example, an exit condition like `if (i > M) break;`. Typically, such conditions should have already been removed by either fusing with the latch termination condition above `while(i < N)`. These are not as interesting, since we have ways to handle this through earlier optimizations.
+* A regular/computable early exits where there is no dependence on values loaded from memory. For example, an exit condition like `if (i > M) break;`. Typically, such conditions should either have already been removed by early optimizations (like fusing with the latch termination condition above `while(i < N)`) or handled by the vectorizer by hoisting them out of the loop. These are out of our focus.
 * A data dependent early exit where the condition involves loading from memory and performing some check. For example, `if (a[i] == X) break`. Here, the most important legality constraint we need to prove irrespective of how we choose to vectorize, is that in the vectorized form, we do not load from unmapped memory. 
 
 
 Introduction
 --------------
 
-There are three key differences that need to be considered when we support multi exit loop vectorization. 
+There are three key differences that need to be considered when we support dd-exit loop vectorization. 
 
 The first difference is that in addition to explicit conditions, instruction execution becomes dependent on all preceding (at runtime) conditions guarding dd-exits. That is, in the first case (normal loop vectorization), instructions that are not explicitly guarded will be unconditionally executed for each lane in the vector code. While in the data-dependent exit case, the instructions should not be executed for already exited lanes. That means execution becomes dependent on all conditions guarding dd-exits. Moreover, that effectively means it should be safe to evaluate all such conditions upfront even though some of them may not be evaluated at all in the scalar execution. This introduces additional legality constrains we need to consider. 
 
@@ -78,10 +78,10 @@ Extract(X^, n) – extract nth lane from vector X^, where vector lanes are numbe
  
 
 
-General Model
+Full Predication Approach
 --------------
 
-We now dive into how vectorization will look like when we have multiple exits throughout the loop. The main idea here is that we predicate all the instructions on the (data dependent) conditions which guard the exits. 
+We now dive into how vectorization will look like when we have dd-exits throughout the loop. The main idea here is that we predicate all the instructions on the (data dependent) conditions which guard the exits. 
 
 
 Predication
@@ -399,7 +399,7 @@ EMask(X) = (Pi | … | Pj), where Pi are predicates under which X is defined.
 
 
 
-The Simple Approach
+Early Exit Approach
 --------------------
 
 Well, vectorization of loops with dd-exits is challenging task because the loop can be exited from the middle. But what if we make vector code to execute all iterations but the last one where the loop is exited? In other words, we can copy original loop and rewrite it in the form where all original dd-exits are replaced with a single test placed at the very beginning of the loop. If the test passes, continue with the loop body otherwise fall back to the original scalar loop with dd-exits. Let’s see how the described transformation looks like on the predication_example_ from above :
@@ -432,7 +432,7 @@ Well, vectorization of loops with dd-exits is challenging task because the loop 
  
 So, we effectively converted our task of vectorization of a loop with dd-exits into vectorization of a loop with single early dd-exit. 
 
-Simple Approach Predication
+Predication
 ===========================
 
 Let us see how predicates change under C1^| … | Cn^ == 0 assumption:
@@ -476,33 +476,33 @@ That is, vector body does not need any predication anymore and loop exit blocks 
    }
   }
 
-The key point here is unlike the general approach the scalar post loop will need to run if we early exit the loop as we do not have predication. However, this also gives us a neat way to insert additional guards since it is 
+The key point here is unlike the “full predication” approach the scalar post loop will need to run if we early exit the loop as we do not have predication. However, this also gives us a neat way to insert additional guards since it is 
 since it is always valid to fall back to the scalar loop. 
 
-Simple Approach Hoistability
+Hoistability
 ============================
 
-The general approach required hoisting safety for all conditions guarding dd-exits. The simplified approach does not impose any new requirements. So hoistability requirement for dd-exit conditions remains the same. In the above example, if I0 is `c[i] = a[i] + b [i]` and  C1 is `if (c[i] < X)`, then we cannot *safely hoist* C1 before I0.
+The “full predication” approach required hoisting safety for all conditions guarding dd-exits. The simplified approach does not impose any new requirements. So hoistability requirement for dd-exit conditions remains the same. In the above example, if I0 is `c[i] = a[i] + b [i]` and  C1 is `if (c[i] < X)`, then we cannot *safely hoist* C1 before I0.
 
 
-Simple approach Speculatability
+Speculatability
 ===============================
 Instead of building P0, P1, … predicates this approach requires evaluation of ``anyof(C1^| .. | Cn^)`` at the beginning of the loop. So, it still should be valid to safely speculate dd-exiting conditions. Fortunately, “freezing” technique still works here. Indeed, since ‘poison’ value can only appear at the exiting vector iteration, the loop does not exit at earlier iterations. At the same time if some dd-exit guarded by Ci is taken on iteration ‘m’ (will have ‘1’ at position ‘m’), then ``anyof(freeze(C1^)| .. | freeze(Cn^))`` will be evaluated to ‘1’ and we exit the loop before we branch on poison (thereby avoiding UB being introduced in the vectorized version).
 
-Simple Approach Cost modelling
+Cost modelling
 ==============================
 
 There is a pretty significant difference in cost  between the approaches. This is because each approach works better in certain scenarios:
 
-  - The Simple approach is cheaper for the vectorized loop since each vector instruction is not predicated (we have the early vectorized exit at the start of the loop).
-  - The Simple approach may (very likely) require the scalar epilog loop to run:
+  - The “early exit” approach is cheaper for the vectorized loop since each vector instruction is not predicated (we have the early vectorized exit at the start of the loop).
+  - The “early exit” approach may (very likely) require the scalar epilog loop to run:
      - If we early exited the vectorized loop, we run upto a maximum of VF iterations
      - If we did not early exit the vectorized loop, scalar epilog loop is run until we complete all iterations or early exit that loop
-  - In the general approach we can tail fold the scalar post loop into the vectorized loop without any added penalty since vectorized loop already uses predication.
+  - In the “full predication” approach we can tail fold the scalar post loop into the vectorized loop without any added penalty since vectorized loop already uses predication.
 
 The main problem with early exit vectorization cost modelling is that we do not know how many iterations are actually run, so the scalar post loop if not tail folded can be running more iterations compared to the vectorized version.
 
-Simple Approach Live-Outs
+Live outs
 =========================
 
 Under C1^| … | Cn^ == 0 assumption, last value extraction mask transforms to:
@@ -567,20 +567,20 @@ When we vectorize this loop above, if we were to exit through the vectorized con
   print(y_phi)
 
 
-“General” vs. “Simple” approaches
+“Full Predication” vs. “Early Exit” approaches
 ----------------------------------
 
 There are 5 focus areas that have been discussed in regard to dd-exiting loops vectorization: predication, live outs, hoistability, speculatability and cost modeling. Let’s see what it will take to support each of them for both approaches.
 
-“General” vs. “Simple”: Predication
-   One of the main differences is how predication should be handled. The “general” approach requires full predication. Fortunately, current implementation already has support for the predication.
+“Full Predication” vs. “Early Exit”: Predication
+   One of the main differences is how predication should be handled. The “full predication” approach requires predication. Fortunately, current implementation already has support for the predication.
 
 
-“General” vs. “Simple”: Hoistability
+“Full Predication” vs. “Early Exit”: Hoistability
   Hoist safety analysis is the same in both cases and it has already been implemented in other part of the compiler.
 
-“General” vs. “Simple”: Speculatability
-  Despite apparent similarity there is one important difference between the approaches. Namely, in the “simplified” approach, it is always safe to exit vector loop earlier and continue with the scalar loop. That gives us an opportunity to insert extra guards that were not present in the original loop to prove speculation safety.
+“Full Predication” vs. “Early Exit”: Speculatability
+  Despite apparent similarity there is one important difference between the approaches. Namely, in the “early exit” approach, it is always safe to exit vector loop earlier and continue with the scalar loop. That gives us an opportunity to insert extra guards that were not present in the original loop to prove speculation safety.
 Let us consider the example about indirect_memory_access_ once again. Assume, ‘b’ is provenly dereferenceable in the range from 0 to M. Then all we need to do is to simply guard ‘b[x]’ by checking that x is in the range from 0 to M condition. If we can prove that M == K then c1 can be eliminated from the later guard. 
 
 .. code::
@@ -620,24 +620,24 @@ Let us consider the example about indirect_memory_access_ once again. Assume, �
 
 Note that this same approach can be used when a following condition can only be speculated at the context where the previous condition passed (i.e. we cannot use OR'ing of all conditions together). 
 
-Speculation safety analysis is one of the most important things from practical point of view because many real life examples involve loads speculation. An ability to insert extra guards in the “simple” approach can be critical.
+Speculation safety analysis is one of the most important things from practical point of view because many real life examples involve loads speculation. An ability to insert extra guards in the “arly exit” approach can be critical.
 
-“General” vs. “Simple”: Cost model
+“Full Predication” vs. “Early Exit”: Cost model
 	Even though estimated cost may differ significantly for the two cases it is not expected to require much implementation efforts. 
 
-“General” vs. “Simple”: Live outs
-   The critical difference is in live outs support. The “general” approach requires special handling of exit blocks (either through predication or explicit control flow) and tracking of last value extraction mask for each live-out individually. The “simple” approach does not require any extra efforts comparing to “normal” case because live outs are naturally handled by scalar post loop.
+“Full Predication” vs. “Early Exit”: Live outs
+   The critical difference is in live outs support. The “full predication” approach requires special handling of exit blocks (either through predication or explicit control flow) and tracking of last value extraction mask for each live-out individually. The “early exit” approach does not require any extra efforts comparing to “normal” case because live outs are naturally handled by scalar post loop.
 
 
-An approach without changing existing Loop Vectorizer code
+A possible implementation of "Early Exit" approach
 ----------------------------------------------------------
 
-There is one extra consideration not explicitly discussed so far but has potential to drive our choice of the approach to implement. As careful reader has already noted the “simple” approach has very few differences with “normal” vectorization case. That not only makes it simpler to support it in the current vectorizer but opens an opportunity to implement it as a standalone pass. The process looks the following way. First, the original loop is cloned and preprocessed to remove dd-exits and hoist corresponding conditions. Hoisting and speculation safety should be proven before doing that. Next, the resulting cloned loop is passed to the vectorizer. Finally, vectorized loop is postprocessed. During postprocessing an early exit is inserted, and live outs are fixed up to account for new exit. In addition, scalar prologue produced by the vectorizer is substituted with the original scalar loop. Cost estimation should also be corrected because hoisted dd-exit conditions are speculatively executed in the vector version and may be conditionally executed in scalar version. 
+There is one extra consideration not explicitly discussed so far but has potential to drive our choice of the approach to implement. As careful reader has already noted the “early exit” approach has very few differences with “normal” vectorization case. That not only makes it simpler to support it in the current vectorizer but opens an opportunity to implement it as a standalone pass. The process looks the following way. First, the original loop is cloned and preprocessed to remove dd-exits and hoist corresponding conditions. Hoisting and speculation safety should be proven before doing that. Next, the resulting cloned loop is passed to the vectorizer. Finally, vectorized loop is postprocessed. During postprocessing an early exit is inserted, and live outs are fixed up to account for new exit. In addition, scalar prologue produced by the vectorizer is substituted with the original scalar loop. Cost estimation should also be corrected because hoisted dd-exit conditions are speculatively executed in the vector version and may be conditionally executed in scalar version. 
 
 Conclusion
 ----------
 
-We talk about two different approaches to handle data dependent exit loop vectorization and go over how to handle major aspects of legality, functionality and cost model in each approach. Each approach has different motivations such as the general approach works best when predication is cheap. There are couple of open questions such as:
+We talk about two different approaches to handle dd-exit loop vectorization and go over how to handle major aspects of legality, functionality and cost model in each approach. Each approach has different motivations such as the  approach works best when predication is cheap. There are couple of open questions such as:
 
 * how we would identify loops where this sort of vectorization is not profitable (both approaches are affected by this, but the penalty touches different aspects)
 
